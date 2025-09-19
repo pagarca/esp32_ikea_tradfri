@@ -1,0 +1,25 @@
+# Target SoC
+CONFIG_IDF_TARGET="esp32c6"
+
+# Use custom partitions
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0x8000
+
+# Enable Zigbee and IEEE802154
+CONFIG_ZB_ENABLED=y
+# Use Coordinator/Router role (required to form/open network)
+CONFIG_ZB_ZCZR=y
+# CONFIG_ZB_ZED is not set
+CONFIG_ZB_RADIO_NATIVE=y
+CONFIG_IEEE802154_ENABLED=y
+CONFIG_ESP_MAC_ADDR_UNIVERSE_IEEE802154=y
+## Disable Green Power to avoid pulling GP cluster handlers
+# CONFIG_ZB_GP_ENABLED is not set
+
+# Increase main task stack if needed
+CONFIG_MAIN_TASK_STACK_SIZE=7168
+
+# Logging
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
