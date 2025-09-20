@@ -10,6 +10,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
+#include "driver/gpio.h"
 
 #include "esp_zigbee_core.h"
 #include "platform/esp_zigbee_platform.h"
@@ -19,6 +20,9 @@
 #include "nwk/esp_zigbee_nwk.h"
 // Añadimos utilidades HA para crear un endpoint local mínimo
 #include "ha/esp_zigbee_ha_standard.h"
+// LED RGB integrado (WS2812) controlado por RMT
+#include "led_strip.h"
+#include "freertos/timers.h"
 
 static const char *TAG = "ZB_SCAN";
 
@@ -27,6 +31,25 @@ static const char *TAG = "ZB_SCAN";
 // Scan duration (beacon intervals): time per channel = ((1<<d)+1) * 15.36 ms
 // Para scans ZDO puntuales (opcional)
 #define ZB_SCAN_DURATION      (4)  // ~ (16+1)*15.36ms ≈ 261 ms por canal
+
+// Asunción: la placa tiene un LED RGB WS2812 en el GPIO 8 (ESP32-C6 DevKitC)
+#ifndef BOARD_RGB_LED_GPIO
+#define BOARD_RGB_LED_GPIO     (8)
+#endif
+// Buzzer activo en GPIO 10 (nivel alto = suena)
+#ifndef BUZZER_GPIO
+#define BUZZER_GPIO            (10)
+#endif
+
+static led_strip_handle_t s_led_strip = NULL;
+static TimerHandle_t s_led_timer = NULL; // para volver a verde tras 15s
+static TimerHandle_t s_buzzer_timer = NULL; // parpadeo del buzzer durante alerta
+static volatile bool s_buzzer_state = false;
+
+// Estado para no repetir alertas por el mismo dispositivo
+static uint16_t s_alerted[16];
+static uint8_t s_alerted_count = 0;
+static uint8_t s_alerted_wr_idx = 0;
 
 static void zb_start_active_scan(uint8_t param);
 static void try_read_basic_attrs(uint16_t nwk_addr, uint8_t endpoint);
@@ -37,44 +60,121 @@ static void reopen_steering_cb(uint8_t param);
 
 static bool contains_word_ci(const char *haystack, const char *needle)
 {
-	if (!haystack || !needle) return false;
-	size_t nlen = strlen(needle);
-	if (nlen == 0) return true;
-	for (const char *p = haystack; *p; ++p) {
-		size_t i = 0;
-		while (i < nlen && p[i] && (char)tolower((unsigned char)p[i]) == (char)tolower((unsigned char)needle[i])) {
-			i++;
-		}
-		if (i == nlen) return true;
+    if (!haystack || !needle) return false;
+    size_t nlen = strlen(needle);
+    if (nlen == 0) return true;
+    for (const char *p = haystack; *p; ++p) {
+        size_t i = 0;
+        while (i < nlen && p[i] && (char)tolower((unsigned char)p[i]) == (char)tolower((unsigned char)needle[i])) {
+            i++;
+        }
+        if (i == nlen) return true;
+    }
+    return false;
+}
+
+static void led_set_rgb(uint8_t r, uint8_t g, uint8_t b)
+{
+	if (!s_led_strip) return;
+	// Establecer color del primer píxel y refrescar
+	// Algunas placas WS2812 usan orden GRB; intercambiamos R<->G para corregir colores
+	(void)led_strip_set_pixel(s_led_strip, 0, g, r, b);
+	(void)led_strip_refresh(s_led_strip);
+}
+
+static void led_timer_cb(TimerHandle_t xTimer)
+{
+	(void)xTimer;
+	// Volver a color verde (reposo)
+	led_set_rgb(0, 255, 0);
+	// Buzzer activo: apagar (nivel bajo)
+	gpio_set_level(BUZZER_GPIO, 0);
+	// Parar parpadeo del buzzer
+	if (s_buzzer_timer) {
+		xTimerStop(s_buzzer_timer, 0);
 	}
-	return false;
+}
+
+static void led_init(void)
+{
+	// Configurar dispositivo LED strip con RMT
+	led_strip_config_t strip_config = {
+		.strip_gpio_num = BOARD_RGB_LED_GPIO,
+		.max_leds = 1,
+		.led_model = LED_MODEL_WS2812,
+		.flags.invert_out = false,
+	};
+	led_strip_rmt_config_t rmt_config = {
+		.resolution_hz = 10 * 1000 * 1000, // 10MHz
+		.flags.with_dma = false,
+	};
+	esp_err_t err = led_strip_new_rmt_device(&strip_config, &rmt_config, &s_led_strip);
+	if (err != ESP_OK) {
+		ESP_LOGW(TAG, "No se pudo inicializar LED RGB (gpio=%d): %s", BOARD_RGB_LED_GPIO, esp_err_to_name(err));
+		s_led_strip = NULL;
+		return;
+	}
+	(void)led_strip_clear(s_led_strip);
+	// Crear temporizador one-shot de 15 segundos
+	s_led_timer = xTimerCreate("led_to_green", pdMS_TO_TICKS(15000), pdFALSE, NULL, led_timer_cb);
+	if (s_led_timer == NULL) {
+		ESP_LOGW(TAG, "No se pudo crear temporizador de LED");
+	}
+	// Estado en reposo: verde
+	led_set_rgb(0, 255, 0);
+}
+
+static void buzzer_init(void)
+{
+	gpio_config_t io = {
+		.pin_bit_mask = 1ULL << BUZZER_GPIO,
+		.mode = GPIO_MODE_OUTPUT,
+		.pull_up_en = GPIO_PULLUP_DISABLE,
+		.pull_down_en = GPIO_PULLDOWN_DISABLE,
+		.intr_type = GPIO_INTR_DISABLE,
+	};
+	esp_err_t err = gpio_config(&io);
+	if (err != ESP_OK) {
+		ESP_LOGW(TAG, "No se pudo configurar GPIO %d para zumbador: %s", BUZZER_GPIO, esp_err_to_name(err));
+	}
+	// Buzzer inactivo por defecto
+	gpio_set_level(BUZZER_GPIO, 0);
+}
+
+static void buzzer_toggle_cb(TimerHandle_t xTimer)
+{
+	(void)xTimer;
+	s_buzzer_state = !s_buzzer_state;
+	gpio_set_level(BUZZER_GPIO, s_buzzer_state ? 1 : 0);
+}
+
+static void buzzer_timer_create(void)
+{
+	// Timer periódico para parpadeo a 2 Hz (toggle cada 250 ms)
+	if (!s_buzzer_timer) {
+		s_buzzer_timer = xTimerCreate("buzz_tgl", pdMS_TO_TICKS(250), pdTRUE, NULL, buzzer_toggle_cb);
+	}
 }
 
 // Evita alertar dos veces por el mismo dispositivo
 static bool has_alerted_for(uint16_t short_addr)
 {
-	static uint16_t alerted[16];
-	static uint8_t count = 0;
-	for (uint8_t i = 0; i < count; i++) {
-		if (alerted[i] == short_addr) return true;
+	for (uint8_t i = 0; i < s_alerted_count; i++) {
+		if (s_alerted[i] == short_addr) return true;
 	}
 	return false;
 }
 
 static void mark_alerted_for(uint16_t short_addr)
 {
-	static uint16_t alerted[16];
-	static uint8_t count = 0;
-	// Buscar si ya está
-	for (uint8_t i = 0; i < count; i++) {
-		if (alerted[i] == short_addr) return;
+	for (uint8_t i = 0; i < s_alerted_count; i++) {
+		if (s_alerted[i] == short_addr) return;
 	}
-	if (count < (uint8_t)(sizeof(alerted)/sizeof(alerted[0]))) {
-		alerted[count++] = short_addr;
+	if (s_alerted_count < (uint8_t)(sizeof(s_alerted)/sizeof(s_alerted[0]))) {
+		s_alerted[s_alerted_count++] = short_addr;
 	} else {
 		// Política simple: sobreescribir circularmente
-		static uint8_t idx = 0;
-		alerted[idx++ % (uint8_t)(sizeof(alerted)/sizeof(alerted[0]))] = short_addr;
+		s_alerted[s_alerted_wr_idx++ % (uint8_t)(sizeof(s_alerted)/sizeof(s_alerted[0]))] = short_addr;
 	}
 }
 
@@ -150,7 +250,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_s)
 					p->capability);
 			esp_zb_zdo_active_ep_req_param_t aep = {.addr_of_interest = p->device_short_addr};
 			ESP_LOGI(TAG, "Solicitando ActiveEP a 0x%04X", p->device_short_addr);
-			esp_zb_zdo_active_ep_req(&aep, active_ep_cb, (void *)(uintptr_t)p->device_short_addr);
+            esp_zb_zdo_active_ep_req(&aep, active_ep_cb, (void *)(uintptr_t)p->device_short_addr);
 		} else {
 			ESP_LOGW(TAG, "DEVICE_ANNCE sin parámetros. Ignorando");
 		}
@@ -261,6 +361,21 @@ static esp_err_t zcl_action_handler(esp_zb_core_action_callback_id_t cb_id, cons
 			}
 			if (any_match) {
 				uint16_t src = m->info.src_address.u.short_addr;
+				// Encender LED rojo durante 15s cada vez que se detecte
+				led_set_rgb(255, 0, 0);
+				if (s_led_timer) {
+					xTimerStop(s_led_timer, 0);
+					xTimerStart(s_led_timer, 0);
+				}
+				// Buzzer activo: iniciar parpadeo a 2 Hz
+				buzzer_timer_create();
+				// Asegurar inicio en ON y coherencia del estado
+				gpio_set_level(BUZZER_GPIO, 1);
+				s_buzzer_state = true; // siguiente toggle -> OFF
+				if (s_buzzer_timer) {
+					xTimerStop(s_buzzer_timer, 0);
+					xTimerStart(s_buzzer_timer, 0);
+				}
 				if (!has_alerted_for(src)) {
 					ESP_LOGW(TAG, "ALERTA: Detectada bombilla IKEA TRÅDFRI (0x%04X ep%u)", src, m->info.src_endpoint);
 					mark_alerted_for(src);
@@ -331,6 +446,11 @@ void app_main(void)
 		},
 	};
 	ESP_ERROR_CHECK(esp_zb_platform_config(&platform_cfg));
+
+	// Inicializar LED RGB integrado (si existe)
+	led_init();
+	// Inicializar zumbador activo en GPIO
+	buzzer_init();
 
 	// Crear tarea Zigbee (stack más holgado)
 	xTaskCreate(zigbee_task, "zigbee_main", 7168, NULL, 5, NULL);
