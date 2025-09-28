@@ -1,7 +1,7 @@
 // Zigbee Coordinator example for ESP32-C6
-// - Inicia la pila Zigbee en modo no-autostart
-// - Forma una red (BDB network formation) y la abre a emparejamientos
-// - Detecta dispositivos que se unan y, si son IKEA TRÅDFRI, levanta alerta
+// - Start the Zigbee stack in no-autostart mode
+// - Form a network (BDB network formation) and open it for joining
+// - Detect devices that join and raise an alert if they are IKEA TRÅDFRI
 
 #include <stdio.h>
 #include <string.h>
@@ -19,9 +19,9 @@
 #include "zcl/esp_zigbee_zcl_command.h"
 #include "zcl/esp_zigbee_zcl_common.h"
 #include "nwk/esp_zigbee_nwk.h"
-// Añadimos utilidades HA para crear un endpoint local mínimo
+// HA utilities to create a minimal local endpoint
 #include "ha/esp_zigbee_ha_standard.h"
-// LED RGB integrado (WS2812) controlado por RMT
+// On-board RGB LED (WS2812) driven via RMT
 #include "led_strip.h"
 #include "freertos/timers.h"
 
@@ -30,29 +30,29 @@ static const char *TAG = "ZB_SCAN";
 // Channel mask: channels 11..26
 #define ZB_SCAN_CHANNEL_MASK  (0x07FFF800)
 // Scan duration (beacon intervals): time per channel = ((1<<d)+1) * 15.36 ms
-// Para scans ZDO puntuales (opcional)
-#define ZB_SCAN_DURATION      (4)  // ~ (16+1)*15.36ms ≈ 261 ms por canal
+// For occasional ZDO scans (optional)
+#define ZB_SCAN_DURATION      (4)  // ~ (16+1)*15.36ms ≈ 261 ms per channel
 
-// Asunción: la placa tiene un LED RGB WS2812 en el GPIO 8 (ESP32-C6 DevKitC)
+// Assumption: the board has a WS2812 RGB LED on GPIO 8 (ESP32-C6 DevKitC)
 #ifndef BOARD_RGB_LED_GPIO
 #define BOARD_RGB_LED_GPIO     (8)
 #endif
-// Buzzer activo en GPIO 10 (nivel alto = suena)
+// Active buzzer on GPIO 10 (logic high = ON)
 #ifndef BUZZER_GPIO
 #define BUZZER_GPIO            (10)
 #endif
 
-// Duración de la alarma (LED rojo + zumbador activo) en milisegundos
+// Alert duration (LED red + active buzzer) in milliseconds
 #ifndef ALERT_DURATION_MS
 #define ALERT_DURATION_MS       (10 * 1000) // 10 segundos
 #endif
 
-// Volumen del zumbador activo en porcentaje (0..100). Implementado con PWM LEDC
+// Active buzzer volume percentage (0..100). Implemented with LEDC PWM
 #ifndef BUZZER_VOLUME_PCT
 #define BUZZER_VOLUME_PCT       (75)
 #endif
 
-// Configuración PWM para el zumbador
+// PWM configuration for the buzzer
 #ifndef BUZZER_PWM_FREQ_HZ
 #define BUZZER_PWM_FREQ_HZ      (5000) // 5 kHz
 #endif
@@ -66,16 +66,16 @@ static const char *TAG = "ZB_SCAN";
 #define BUZZER_LEDC_CHANNEL     LEDC_CHANNEL_0
 #endif
 #ifndef BUZZER_LEDC_DUTY_RES
-#define BUZZER_LEDC_DUTY_RES    LEDC_TIMER_10_BIT // 10 bits -> 1023 máx.
+#define BUZZER_LEDC_DUTY_RES    LEDC_TIMER_10_BIT // 10 bits -> 1023 max
 #endif
 
 static led_strip_handle_t s_led_strip = NULL;
-static TimerHandle_t s_led_timer = NULL; // para volver a verde tras la duración configurada
-static TimerHandle_t s_buzzer_timer = NULL; // parpadeo del buzzer durante alerta
+static TimerHandle_t s_led_timer = NULL; // timer to return to green after the configured duration
+static TimerHandle_t s_buzzer_timer = NULL; // buzzer blink timer during alert
 static volatile bool s_buzzer_state = false;
-static uint32_t s_buzzer_on_duty = 0;       // duty correspondiente al volumen configurado
+static uint32_t s_buzzer_on_duty = 0;       // duty for the configured volume
 
-// Estado para no repetir alertas por el mismo dispositivo
+// Track devices already alerted to avoid duplicates
 static uint16_t s_alerted[16];
 static uint8_t s_alerted_count = 0;
 static uint8_t s_alerted_wr_idx = 0;
@@ -105,8 +105,8 @@ static bool contains_word_ci(const char *haystack, const char *needle)
 static void led_set_rgb(uint8_t r, uint8_t g, uint8_t b)
 {
 	if (!s_led_strip) return;
-	// Establecer color del primer píxel y refrescar
-	// Algunas placas WS2812 usan orden GRB; intercambiamos R<->G para corregir colores
+	// Set color of the first pixel and refresh
+	// Some WS2812 boards use GRB order; swap R<->G to correct colors
 	(void)led_strip_set_pixel(s_led_strip, 0, g, r, b);
 	(void)led_strip_refresh(s_led_strip);
 }
@@ -114,12 +114,12 @@ static void led_set_rgb(uint8_t r, uint8_t g, uint8_t b)
 static void led_timer_cb(TimerHandle_t xTimer)
 {
 	(void)xTimer;
-	// Volver a color verde (reposo)
+	// Return to green (idle)
 	led_set_rgb(0, 255, 0);
-	// Buzzer activo: apagar PWM (duty 0)
+	// Active buzzer: turn off PWM (duty 0)
 	(void)ledc_set_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL, 0);
 	(void)ledc_update_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL);
-	// Parar parpadeo del buzzer
+	// Stop buzzer blink
 	if (s_buzzer_timer) {
 		xTimerStop(s_buzzer_timer, 0);
 	}
@@ -127,7 +127,7 @@ static void led_timer_cb(TimerHandle_t xTimer)
 
 static void led_init(void)
 {
-	// Configurar dispositivo LED strip con RMT
+	// Configure LED strip device with RMT
 	led_strip_config_t strip_config = {
 		.strip_gpio_num = BOARD_RGB_LED_GPIO,
 		.max_leds = 1,
@@ -145,18 +145,18 @@ static void led_init(void)
 		return;
 	}
 	(void)led_strip_clear(s_led_strip);
-	// Crear temporizador one-shot con la duración de alarma configurada
+	// Create one-shot timer with the configured alert duration
 	s_led_timer = xTimerCreate("led_to_green", pdMS_TO_TICKS(ALERT_DURATION_MS), pdFALSE, NULL, led_timer_cb);
 	if (s_led_timer == NULL) {
 		ESP_LOGW(TAG, "No se pudo crear temporizador de LED");
 	}
-	// Estado en reposo: verde
+	// Idle state: green
 	led_set_rgb(0, 255, 0);
 }
 
 static void buzzer_init(void)
 {
-	// Configurar LEDC para PWM en el GPIO del zumbador
+	// Configure LEDC for PWM on the buzzer GPIO
 	ledc_timer_config_t tcfg = {
 		.speed_mode = BUZZER_LEDC_MODE,
 		.duty_resolution = BUZZER_LEDC_DUTY_RES,
@@ -182,11 +182,11 @@ static void buzzer_init(void)
 	if (err != ESP_OK) {
 		ESP_LOGW(TAG, "LEDC channel cfg fallo: %s", esp_err_to_name(err));
 	}
-	// Calcular duty correspondiente al volumen
+	// Compute duty for the configured volume
 	uint32_t max_duty = (1U << (int)BUZZER_LEDC_DUTY_RES) - 1U;
 	uint32_t pct = (BUZZER_VOLUME_PCT > 100) ? 100 : BUZZER_VOLUME_PCT;
 	s_buzzer_on_duty = (max_duty * pct) / 100U;
-	// Asegurar apagado inicial
+	// Ensure initial OFF
 	(void)ledc_set_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL, 0);
 	(void)ledc_update_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL);
 }
@@ -206,13 +206,13 @@ static void buzzer_toggle_cb(TimerHandle_t xTimer)
 
 static void buzzer_timer_create(void)
 {
-	// Timer periódico para parpadeo a 2 Hz (toggle cada 250 ms)
+	// Periodic timer for 2 Hz blink (toggle every 250 ms)
 	if (!s_buzzer_timer) {
 		s_buzzer_timer = xTimerCreate("buzz_tgl", pdMS_TO_TICKS(250), pdTRUE, NULL, buzzer_toggle_cb);
 	}
 }
 
-// Evita alertar dos veces por el mismo dispositivo
+// Avoid alerting twice for the same device
 static bool has_alerted_for(uint16_t short_addr)
 {
 	for (uint8_t i = 0; i < s_alerted_count; i++) {
@@ -229,7 +229,7 @@ static void mark_alerted_for(uint16_t short_addr)
 	if (s_alerted_count < (uint8_t)(sizeof(s_alerted)/sizeof(s_alerted[0]))) {
 		s_alerted[s_alerted_count++] = short_addr;
 	} else {
-		// Política simple: sobreescribir circularmente
+		// Simple policy: circular overwrite
 		s_alerted[s_alerted_wr_idx++ % (uint8_t)(sizeof(s_alerted)/sizeof(s_alerted[0]))] = short_addr;
 	}
 }
@@ -253,7 +253,7 @@ static void zb_scan_complete_cb(esp_zb_zdp_status_t zdo_status, uint8_t count,
 	if (count == 0) {
 		ESP_LOGW(TAG, "No se han encontrado redes Zigbee.");
 	}
-	// Puede volver a programar otro escaneo si se desea (por ejemplo, cada 10s)
+	// Optionally schedule another scan (e.g., every 1s)
 	esp_zb_scheduler_alarm(zb_start_active_scan, 0, 1000);
 }
 
@@ -269,7 +269,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_s)
 
 	switch (sig) {
 	case ESP_ZB_ZDO_SIGNAL_SKIP_STARTUP:
-		// La pila está lista: formamos red como ZC y abrimos la red a emparejamientos
+		// Stack is ready: form a network as Coordinator and open for joining
 		ESP_LOGI(TAG, "Formando red (BDB network formation)...");
 		esp_zb_set_bdb_commissioning_mode(ESP_ZB_BDB_MODE_NETWORK_FORMATION);
 		ESP_ERROR_CHECK(esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_FORMATION));
@@ -282,13 +282,13 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_s)
 			ESP_ERROR_CHECK(esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING));
 		} else {
 			ESP_LOGE(TAG, "Fallo al formar red (status=%s). Reintentando en 3s", esp_err_to_name(st));
-			esp_zb_scheduler_alarm(NULL, 0, 3000); // placeholder si quisiéramos reintentar
+			esp_zb_scheduler_alarm(NULL, 0, 3000); // placeholder to retry later if desired
 		}
 		break;
 	case ESP_ZB_BDB_SIGNAL_STEERING:
 		if (st == ESP_OK) {
 			ESP_LOGI(TAG, "Steering completado. Mantendremos la red abierta reintentando steering periódicamente.");
-			// Reabrir steering cada 60s para facilitar el join si se pierde la ventana
+			// Re-open steering every 60s to make joining easier if the window was missed
 			esp_zb_scheduler_alarm(reopen_steering_cb, 0, 60000);
 		} else {
 			ESP_LOGW(TAG, "Steering fallido o cancelado (%s). Reintentando en 10s", esp_err_to_name(st));
@@ -296,7 +296,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_s)
 		}
 		break;
 	case ESP_ZB_ZDO_SIGNAL_DEVICE_ANNCE: {
-		// Un dispositivo ha anunciado su presencia tras unirse/reunirse
+		// A device announced its presence after joining/rejoining
 		esp_zb_zdo_signal_device_annce_params_t *p = (esp_zb_zdo_signal_device_annce_params_t *)esp_zb_app_signal_get_params(sg);
 		if (p) {
 			ESP_LOGI(TAG, "DEVICE_ANNCE: short=0x%04X ieee=%02X:%02X:%02X:%02X:%02X:%02X:%02X:%02X cap=0x%02X",
@@ -322,7 +322,7 @@ static void zb_start_active_scan(uint8_t param)
 	(void)param;
 	ESP_LOGI(TAG, "Iniciando escaneo activo Zigbee: mask=0x%08lX dur=%u",
 			 (unsigned long)ZB_SCAN_CHANNEL_MASK, (unsigned)ZB_SCAN_DURATION);
-	// Lanza escaneo activo; el callback se ejecutará desde la tarea Zigbee
+	// Launch active scan; callback will run from the Zigbee task
 	esp_zb_zdo_active_scan_request(ZB_SCAN_CHANNEL_MASK, ZB_SCAN_DURATION, zb_scan_complete_cb);
 }
 
@@ -337,7 +337,7 @@ static void active_ep_cb(esp_zb_zdp_status_t zdo_status, uint8_t ep_count, uint8
 	for (uint8_t i = 0; i < ep_count; i++) {
 		ESP_LOGI(TAG, "  - ep %u", ep_id_list[i]);
 	}
-	// Consultamos simple descriptor de todos los endpoints para encontrar Basic 0x0000
+	// Request Simple Descriptor for all endpoints to find Basic 0x0000
 	for (uint8_t i = 0; i < ep_count; i++) {
 		esp_zb_zdo_simple_desc_req_param_t sreq = {
 			.addr_of_interest = nwk_addr,
@@ -355,9 +355,9 @@ static void simple_desc_cb(esp_zb_zdp_status_t zdo_status, esp_zb_af_simple_desc
 		return;
 	}
 	ESP_LOGI(TAG, "SimpleDesc: ep=%u profile=0x%04X device=0x%04X", sd->endpoint, sd->app_profile_id, sd->app_device_id);
-	// Solo intentamos lectura de Basic en perfiles HA (0x0104). Evitamos ep 242 (Green Power)
+	// Only try to read Basic on HA profile endpoints (0x0104). Skip ep 242 (Green Power)
 	if (sd->app_profile_id == 0x0104) {
-		// Intentamos lectura de Basic 0x0000 (Manufacturer Name 0x0004, Model Id 0x0005)
+		// Try reading Basic 0x0000 (Manufacturer Name 0x0004, Model Id 0x0005)
 		try_read_basic_attrs(nwk_addr, sd->endpoint);
 	} else {
 		ESP_LOGI(TAG, "Perfil no-HA (0x%04X) en ep %u: omitimos lectura Basic", sd->app_profile_id, sd->endpoint);
@@ -392,12 +392,12 @@ static esp_err_t zcl_action_handler(esp_zb_core_action_callback_id_t cb_id, cons
 		const esp_zb_zcl_cmd_read_attr_resp_message_t *m = (const esp_zb_zcl_cmd_read_attr_resp_message_t *)message;
 		const uint16_t cluster = m->info.cluster;
 		if (cluster == 0x0000) {
-			// Recorremos variables de respuesta
+			// Iterate response variables
 			bool any_match = false;
 			for (esp_zb_zcl_read_attr_resp_variable_t *v = m->variables; v; v = v->next) {
 				if (v->status != ESP_ZB_ZCL_STATUS_SUCCESS) continue;
 				uint16_t attr_id = v->attribute.id;
-				// Los atributos string llevan el primer byte como longitud
+				// String attributes carry the first byte as length
 				if (v->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_CHAR_STRING ||
 					v->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_LONG_CHAR_STRING) {
 					const uint8_t *raw = (const uint8_t *)v->attribute.data.value;
@@ -417,15 +417,15 @@ static esp_err_t zcl_action_handler(esp_zb_core_action_callback_id_t cb_id, cons
 			}
 			if (any_match) {
 				uint16_t src = m->info.src_address.u.short_addr;
-				// Encender LED rojo durante la duración configurada cada vez que se detecte
+				// Set LED red for the configured duration whenever detected
 				led_set_rgb(255, 0, 0);
 				if (s_led_timer) {
 					xTimerStop(s_led_timer, 0);
 					xTimerStart(s_led_timer, 0);
 				}
-				// Buzzer activo: iniciar parpadeo a 2 Hz
+				// Active buzzer: start 2 Hz blinking
 				buzzer_timer_create();
-				// Asegurar inicio en ON (duty según volumen) y coherencia del estado
+				// Ensure starting in ON state (duty according to volume) and state coherence
 				(void)ledc_set_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL, s_buzzer_on_duty);
 				(void)ledc_update_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL);
 				s_buzzer_state = true; // siguiente toggle -> OFF
@@ -445,7 +445,7 @@ static esp_err_t zcl_action_handler(esp_zb_core_action_callback_id_t cb_id, cons
 
 static void zigbee_task(void *pv)
 {
-	// Configurar Zigbee como Coordinador para formar red propia
+	// Configure Zigbee as Coordinator to form our own network
 	esp_zb_cfg_t cfg = {
 		.esp_zb_role = ESP_ZB_DEVICE_TYPE_COORDINATOR,
 		.install_code_policy = false,
@@ -457,21 +457,21 @@ static void zigbee_task(void *pv)
 	};
 	esp_zb_init(&cfg);
 
-	// Registrar un endpoint local mínimo (HA Configuration Tool) en ep=1
-	// Esto proporciona Basic/Identify y un endpoint de origen válido para comandos ZCL
+	// Register a minimal local endpoint (HA Configuration Tool) on ep=1
+	// Provides Basic/Identify and a valid source endpoint for ZCL commands
 	esp_zb_configuration_tool_cfg_t ha_cfg = ESP_ZB_DEFAULT_CONFIGURATION_TOOL_CONFIG();
 	esp_zb_ep_list_t *ep_list = esp_zb_configuration_tool_ep_create(1 /*endpoint id*/, &ha_cfg);
 	ESP_ERROR_CHECK(esp_zb_device_register(ep_list));
-	// Registrar handler de acciones ZCL (respuestas de lectura, etc.)
+	// Register ZCL core action handler (read responses, etc.)
 	esp_zb_core_action_handler_register(zcl_action_handler);
 
-	// Canales permitidos
+	// Allowed channels
 	esp_zb_set_primary_network_channel_set(ZB_SCAN_CHANNEL_MASK);
 
-	// Arrancar la pila sin autostart; manejamos BDB en el signal handler
+	// Start the stack without autostart; handle BDB in the signal handler
 	ESP_ERROR_CHECK(esp_zb_start(false));
 
-	// Ejecutar bucle principal de Zigbee (bloqueante)
+	// Run Zigbee main loop (blocking)
 	esp_zb_stack_main_loop();
 }
 
@@ -491,24 +491,24 @@ void app_main(void)
 {
 	ESP_ERROR_CHECK(nvs_flash_init());
 
-	// Configuración de plataforma (radio nativo + host por defecto)
+	// Platform configuration (native radio + default host)
 	esp_zb_platform_config_t platform_cfg = {
 		.radio_config = {
-			.radio_mode = ZB_RADIO_MODE_NATIVE,   // Usar radio IEEE 802.15.4 nativa del ESP32-C6
-			// .radio_uart_config queda a cero (no se usa en modo nativo)
+			.radio_mode = ZB_RADIO_MODE_NATIVE,   // Use ESP32-C6 native IEEE 802.15.4 radio
+			// .radio_uart_config left zero (unused in native mode)
 		},
 		.host_config = {
-			.host_connection_mode = ZB_HOST_CONNECTION_MODE_NONE, // Sin conexión host
-			// .host_uart_config queda a cero
+			.host_connection_mode = ZB_HOST_CONNECTION_MODE_NONE, // No host connection
+			// .host_uart_config left zero
 		},
 	};
 	ESP_ERROR_CHECK(esp_zb_platform_config(&platform_cfg));
 
-	// Inicializar LED RGB integrado (si existe)
+	// Initialize on-board RGB LED (if present)
 	led_init();
-	// Inicializar zumbador activo en GPIO
+	// Initialize active buzzer (PWM on GPIO)
 	buzzer_init();
 
-	// Crear tarea Zigbee (stack más holgado)
+	// Create Zigbee task (larger stack)
 	xTaskCreate(zigbee_task, "zigbee_main", 7168, NULL, 5, NULL);
 }
