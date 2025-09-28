@@ -11,6 +11,7 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "driver/gpio.h"
+#include "driver/ledc.h"
 
 #include "esp_zigbee_core.h"
 #include "platform/esp_zigbee_platform.h"
@@ -41,10 +42,38 @@ static const char *TAG = "ZB_SCAN";
 #define BUZZER_GPIO            (10)
 #endif
 
+// Duración de la alarma (LED rojo + zumbador activo) en milisegundos
+#ifndef ALERT_DURATION_MS
+#define ALERT_DURATION_MS       (10 * 1000) // 10 segundos
+#endif
+
+// Volumen del zumbador activo en porcentaje (0..100). Implementado con PWM LEDC
+#ifndef BUZZER_VOLUME_PCT
+#define BUZZER_VOLUME_PCT       (75)
+#endif
+
+// Configuración PWM para el zumbador
+#ifndef BUZZER_PWM_FREQ_HZ
+#define BUZZER_PWM_FREQ_HZ      (5000) // 5 kHz
+#endif
+#ifndef BUZZER_LEDC_MODE
+#define BUZZER_LEDC_MODE        LEDC_LOW_SPEED_MODE
+#endif
+#ifndef BUZZER_LEDC_TIMER
+#define BUZZER_LEDC_TIMER       LEDC_TIMER_0
+#endif
+#ifndef BUZZER_LEDC_CHANNEL
+#define BUZZER_LEDC_CHANNEL     LEDC_CHANNEL_0
+#endif
+#ifndef BUZZER_LEDC_DUTY_RES
+#define BUZZER_LEDC_DUTY_RES    LEDC_TIMER_10_BIT // 10 bits -> 1023 máx.
+#endif
+
 static led_strip_handle_t s_led_strip = NULL;
-static TimerHandle_t s_led_timer = NULL; // para volver a verde tras 15s
+static TimerHandle_t s_led_timer = NULL; // para volver a verde tras la duración configurada
 static TimerHandle_t s_buzzer_timer = NULL; // parpadeo del buzzer durante alerta
 static volatile bool s_buzzer_state = false;
+static uint32_t s_buzzer_on_duty = 0;       // duty correspondiente al volumen configurado
 
 // Estado para no repetir alertas por el mismo dispositivo
 static uint16_t s_alerted[16];
@@ -87,8 +116,9 @@ static void led_timer_cb(TimerHandle_t xTimer)
 	(void)xTimer;
 	// Volver a color verde (reposo)
 	led_set_rgb(0, 255, 0);
-	// Buzzer activo: apagar (nivel bajo)
-	gpio_set_level(BUZZER_GPIO, 0);
+	// Buzzer activo: apagar PWM (duty 0)
+	(void)ledc_set_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL, 0);
+	(void)ledc_update_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL);
 	// Parar parpadeo del buzzer
 	if (s_buzzer_timer) {
 		xTimerStop(s_buzzer_timer, 0);
@@ -115,8 +145,8 @@ static void led_init(void)
 		return;
 	}
 	(void)led_strip_clear(s_led_strip);
-	// Crear temporizador one-shot de 15 segundos
-	s_led_timer = xTimerCreate("led_to_green", pdMS_TO_TICKS(15000), pdFALSE, NULL, led_timer_cb);
+	// Crear temporizador one-shot con la duración de alarma configurada
+	s_led_timer = xTimerCreate("led_to_green", pdMS_TO_TICKS(ALERT_DURATION_MS), pdFALSE, NULL, led_timer_cb);
 	if (s_led_timer == NULL) {
 		ESP_LOGW(TAG, "No se pudo crear temporizador de LED");
 	}
@@ -126,26 +156,52 @@ static void led_init(void)
 
 static void buzzer_init(void)
 {
-	gpio_config_t io = {
-		.pin_bit_mask = 1ULL << BUZZER_GPIO,
-		.mode = GPIO_MODE_OUTPUT,
-		.pull_up_en = GPIO_PULLUP_DISABLE,
-		.pull_down_en = GPIO_PULLDOWN_DISABLE,
-		.intr_type = GPIO_INTR_DISABLE,
+	// Configurar LEDC para PWM en el GPIO del zumbador
+	ledc_timer_config_t tcfg = {
+		.speed_mode = BUZZER_LEDC_MODE,
+		.duty_resolution = BUZZER_LEDC_DUTY_RES,
+		.timer_num = BUZZER_LEDC_TIMER,
+		.freq_hz = BUZZER_PWM_FREQ_HZ,
+		.clk_cfg = LEDC_AUTO_CLK,
 	};
-	esp_err_t err = gpio_config(&io);
+	esp_err_t err = ledc_timer_config(&tcfg);
 	if (err != ESP_OK) {
-		ESP_LOGW(TAG, "No se pudo configurar GPIO %d para zumbador: %s", BUZZER_GPIO, esp_err_to_name(err));
+		ESP_LOGW(TAG, "LEDC timer cfg fallo: %s", esp_err_to_name(err));
 	}
-	// Buzzer inactivo por defecto
-	gpio_set_level(BUZZER_GPIO, 0);
+	ledc_channel_config_t ccfg = {
+		.gpio_num = BUZZER_GPIO,
+		.speed_mode = BUZZER_LEDC_MODE,
+		.channel = BUZZER_LEDC_CHANNEL,
+		.intr_type = LEDC_INTR_DISABLE,
+		.timer_sel = BUZZER_LEDC_TIMER,
+		.duty = 0,
+		.hpoint = 0,
+		.flags = { .output_invert = 0 },
+	};
+	err = ledc_channel_config(&ccfg);
+	if (err != ESP_OK) {
+		ESP_LOGW(TAG, "LEDC channel cfg fallo: %s", esp_err_to_name(err));
+	}
+	// Calcular duty correspondiente al volumen
+	uint32_t max_duty = (1U << (int)BUZZER_LEDC_DUTY_RES) - 1U;
+	uint32_t pct = (BUZZER_VOLUME_PCT > 100) ? 100 : BUZZER_VOLUME_PCT;
+	s_buzzer_on_duty = (max_duty * pct) / 100U;
+	// Asegurar apagado inicial
+	(void)ledc_set_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL, 0);
+	(void)ledc_update_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL);
 }
 
 static void buzzer_toggle_cb(TimerHandle_t xTimer)
 {
 	(void)xTimer;
 	s_buzzer_state = !s_buzzer_state;
-	gpio_set_level(BUZZER_GPIO, s_buzzer_state ? 1 : 0);
+	if (s_buzzer_state) {
+		(void)ledc_set_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL, s_buzzer_on_duty);
+		(void)ledc_update_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL);
+	} else {
+		(void)ledc_set_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL, 0);
+		(void)ledc_update_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL);
+	}
 }
 
 static void buzzer_timer_create(void)
@@ -361,7 +417,7 @@ static esp_err_t zcl_action_handler(esp_zb_core_action_callback_id_t cb_id, cons
 			}
 			if (any_match) {
 				uint16_t src = m->info.src_address.u.short_addr;
-				// Encender LED rojo durante 15s cada vez que se detecte
+				// Encender LED rojo durante la duración configurada cada vez que se detecte
 				led_set_rgb(255, 0, 0);
 				if (s_led_timer) {
 					xTimerStop(s_led_timer, 0);
@@ -369,8 +425,9 @@ static esp_err_t zcl_action_handler(esp_zb_core_action_callback_id_t cb_id, cons
 				}
 				// Buzzer activo: iniciar parpadeo a 2 Hz
 				buzzer_timer_create();
-				// Asegurar inicio en ON y coherencia del estado
-				gpio_set_level(BUZZER_GPIO, 1);
+				// Asegurar inicio en ON (duty según volumen) y coherencia del estado
+				(void)ledc_set_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL, s_buzzer_on_duty);
+				(void)ledc_update_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL);
 				s_buzzer_state = true; // siguiente toggle -> OFF
 				if (s_buzzer_timer) {
 					xTimerStop(s_buzzer_timer, 0);

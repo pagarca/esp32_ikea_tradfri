@@ -70,11 +70,8 @@ When the ALERT triggers:
 
 ## Customization
 
-- Zigbee channels: `ZB_SCAN_CHANNEL_MASK` (defaults to 11–26).
-- LED and buzzer pins: change `BOARD_RGB_LED_GPIO` (default 8) and `BUZZER_GPIO` (default 10) in `main/main.c`.
-- LED color order: the code uses GRB when sending to the LED strip. If colors look swapped, adjust the channel order in `led_set_rgb()`.
-- Buzzer blink rate: set in the FreeRTOS timer period (default 250 ms → 2 Hz). Increase/decrease to change the beep cadence.
-- Main task stack size: `CONFIG_MAIN_TASK_STACK_SIZE` in `sdkconfig.defaults`.
+ Alert duration: `ALERT_DURATION_MS` in `main/main.c` (default 15000 ms)
+- Buzzer volume: `BUZZER_VOLUME_PCT` (0–100) in `main/main.c` (uses LEDC PWM)
 
 ## Troubleshooting
 
@@ -309,11 +306,8 @@ W (xxx) ZB_SCAN: ALERTA: Detectada bombilla IKEA TRÅDFRI (0xABCD ep1)
 
 ## Personalización
 
-- Canales Zigbee: `ZB_SCAN_CHANNEL_MASK` (por defecto 11–26).
-- Memoria tarea principal: `CONFIG_MAIN_TASK_STACK_SIZE` en `sdkconfig.defaults`.
-
-## Solución de problemas
-
+ Duración de la alerta: `ALERT_DURATION_MS` en `main/main.c` (por defecto 15000 ms)
+- Volumen del zumbador: `BUZZER_VOLUME_PCT` (0–100) en `main/main.c` (usa PWM LEDC)
 - idf.py no se encuentra / errores de build en PowerShell normal:
    - Usa la terminal “ESP-IDF PowerShell” para que el entorno esté configurado.
 
