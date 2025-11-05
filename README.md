@@ -5,7 +5,7 @@ This app turns your ESP32‑C6 into a Zigbee Coordinator that:
 - Forms its own Zigbee network (BDB network formation) and opens it for joining (steering).
 - Detects newly joined devices and reads ZCL Basic cluster (0x0000) attributes “Manufacturer Name” (0x0004) and “Model Identifier” (0x0005).
 - If it detects manufacturer containing “IKEA” and/or model containing “TRÅDFRI”, it raises an ALERT in the logs.
-- Visual and audible feedback: when an IKEA TRÅDFRI bulb is detected, the on‑board RGB LED turns red and an active buzzer on GPIO10 beeps at 2 Hz for 15 seconds; then the LED returns to green and the buzzer stops.
+- Visual and audible feedback: when an IKEA TRÅDFRI bulb is detected, the on‑board RGB LED turns red and an active buzzer on GPIO10 beeps at 2 Hz for 10 seconds; then the LED returns to green and the buzzer stops.
 
 The code and configuration are kept simple and self‑contained.
 
@@ -65,12 +65,12 @@ W (xxx) ZB_SCAN: ALERT: IKEA TRÅDFRI bulb detected (0xABCD ep1)
 
 When the ALERT triggers:
 
-- The RGB LED turns red for 15 seconds and then returns to green (idle).
-- The buzzer on GPIO10 beeps at 2 Hz (on/off every 250 ms) during those 15 seconds, then stops.
+- The RGB LED turns red for 10 seconds and then returns to green (idle).
+- The buzzer on GPIO10 beeps at 2 Hz (on/off every 250 ms) during those 10 seconds, then stops.
 
 ## Customization
 
- Alert duration: `ALERT_DURATION_MS` in `main/main.c` (default 15000 ms)
+ Alert duration: `ALERT_DURATION_MS` in `main/main.c` (default 10000 ms)
 - Buzzer volume: `BUZZER_VOLUME_PCT` (0–100) in `main/main.c` (uses LEDC PWM)
 
 ## Troubleshooting
@@ -90,7 +90,7 @@ When the ALERT triggers:
 
 ## Español
 
-- Indicadores visual y acústico: cuando se detecta una bombilla IKEA TRÅDFRI, el LED RGB integrado se pone en rojo y un zumbador activo en el GPIO10 parpadea a 2 Hz durante 15 segundos; después el LED vuelve a verde y el zumbador se apaga.
+- Indicadores visual y acústico: cuando se detecta una bombilla IKEA TRÅDFRI, el LED RGB integrado se pone en rojo y un zumbador activo en el GPIO10 parpadea a 2 Hz durante 10 segundos; después el LED vuelve a verde y el zumbador se apaga.
 
 El código y la configuración son simples y autocontenidos.
 
@@ -138,7 +138,7 @@ I (xxx) ZB_SCAN: Basic attr 0x0005='TRADFRI bulb E27 ...' (src 0xABCD ep1)
 
 Cuando se dispare la ALERTA:
 
-- El LED RGB se pone rojo durante 15 segundos y luego vuelve a verde (reposo).
+- El LED RGB se pone rojo durante 10 segundos y luego vuelve a verde (reposo).
 
 - Canales Zigbee: `ZB_SCAN_CHANNEL_MASK` (por defecto 11–26).
 - Pines del LED y zumbador: cambia `BOARD_RGB_LED_GPIO` (por defecto 8) y `BUZZER_GPIO` (por defecto 10) en `main/main.c`.
@@ -163,7 +163,7 @@ This app turns your ESP32‑C6 into a Zigbee Coordinator that:
 - Forms its own Zigbee network (BDB network formation) and opens it for joining (steering).
 - Detects newly joined devices and reads ZCL Basic cluster (0x0000) attributes “Manufacturer Name” (0x0004) and “Model Identifier” (0x0005).
 - If it detects manufacturer containing “IKEA” and/or model containing “TRÅDFRI”, it raises an ALERT in the logs.
-- Visual/audible feedback: while an IKEA TRÅDFRI bulb is detected, the on‑board RGB LED turns red and an active buzzer on GPIO10 beeps at 2 Hz for 15 seconds; then the LED returns to green and the buzzer stops.
+- Visual/audible feedback: while an IKEA TRÅDFRI bulb is detected, the on‑board RGB LED turns red and an active buzzer on GPIO10 beeps at 2 Hz for 10 seconds; then the LED returns to green and the buzzer stops.
 
 The code and configuration are kept simple and self‑contained.
 
@@ -211,8 +211,8 @@ W (xxx) ZB_SCAN: ALERT: IKEA TRÅDFRI bulb detected (0xABCD ep1)
 ```
 
 When the ALERT triggers:
-- The RGB LED turns red for 15 seconds and then returns to green (idle).
-- The buzzer on GPIO10 beeps at 2 Hz (on/off every 250 ms) during those 15 seconds, then stops.
+- The RGB LED turns red for 10 seconds and then returns to green (idle).
+- The buzzer on GPIO10 beeps at 2 Hz (on/off every 250 ms) during those 10 seconds, then stops.
 
 ## Customization
 
@@ -306,7 +306,7 @@ W (xxx) ZB_SCAN: ALERTA: Detectada bombilla IKEA TRÅDFRI (0xABCD ep1)
 
 ## Personalización
 
- Duración de la alerta: `ALERT_DURATION_MS` en `main/main.c` (por defecto 15000 ms)
+ Duración de la alerta: `ALERT_DURATION_MS` en `main/main.c` (por defecto 10000 ms)
 - Volumen del zumbador: `BUZZER_VOLUME_PCT` (0–100) en `main/main.c` (usa PWM LEDC)
 - idf.py no se encuentra / errores de build en PowerShell normal:
    - Usa la terminal “ESP-IDF PowerShell” para que el entorno esté configurado.

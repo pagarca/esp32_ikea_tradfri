@@ -42,19 +42,24 @@ static const char *TAG = "ZB_SCAN";
 #define BUZZER_GPIO            (10)
 #endif
 
+// Pin for simulating bulb detection (HIGH = trigger alarm)
+#ifndef SIMULATION_PIN
+#define SIMULATION_PIN          (11)
+#endif
+
 // Alert duration (LED red + active buzzer) in milliseconds
 #ifndef ALERT_DURATION_MS
-#define ALERT_DURATION_MS       (10 * 1000) // 10 segundos
+#define ALERT_DURATION_MS       (10 * 1000) // 10 seconds
 #endif
 
 // Active buzzer volume percentage (0..100). Implemented with LEDC PWM
 #ifndef BUZZER_VOLUME_PCT
-#define BUZZER_VOLUME_PCT       (75)
+#define BUZZER_VOLUME_PCT       (100)
 #endif
 
 // PWM configuration for the buzzer
 #ifndef BUZZER_PWM_FREQ_HZ
-#define BUZZER_PWM_FREQ_HZ      (5000) // 5 kHz
+#define BUZZER_PWM_FREQ_HZ      (2000) // 2 kHz (more audible for some buzzers)
 #endif
 #ifndef BUZZER_LEDC_MODE
 #define BUZZER_LEDC_MODE        LEDC_LOW_SPEED_MODE
@@ -80,12 +85,16 @@ static uint16_t s_alerted[16];
 static uint8_t s_alerted_count = 0;
 static uint8_t s_alerted_wr_idx = 0;
 
+// Simulation flag to avoid multiple alerts
+static bool s_simulation_alerted = false;
+
 static void zb_start_active_scan(uint8_t param);
 static void try_read_basic_attrs(uint16_t nwk_addr, uint8_t endpoint);
 static void active_ep_cb(esp_zb_zdp_status_t zdo_status, uint8_t ep_count, uint8_t *ep_id_list, void *user_ctx);
 static void simple_desc_cb(esp_zb_zdp_status_t zdo_status, esp_zb_af_simple_desc_1_1_t *simple_desc, void *user_ctx);
 static esp_err_t zcl_action_handler(esp_zb_core_action_callback_id_t cb_id, const void *message);
 static void reopen_steering_cb(uint8_t param);
+static void simulation_check_cb(TimerHandle_t xTimer);
 
 static bool contains_word_ci(const char *haystack, const char *needle)
 {
@@ -123,6 +132,8 @@ static void led_timer_cb(TimerHandle_t xTimer)
 	if (s_buzzer_timer) {
 		xTimerStop(s_buzzer_timer, 0);
 	}
+	// Reset simulation flag to allow re-triggering
+	s_simulation_alerted = false;
 }
 
 static void led_init(void)
@@ -140,7 +151,7 @@ static void led_init(void)
 	};
 	esp_err_t err = led_strip_new_rmt_device(&strip_config, &rmt_config, &s_led_strip);
 	if (err != ESP_OK) {
-		ESP_LOGW(TAG, "No se pudo inicializar LED RGB (gpio=%d): %s", BOARD_RGB_LED_GPIO, esp_err_to_name(err));
+		ESP_LOGW(TAG, "Failed to initialize RGB LED (gpio=%d): %s", BOARD_RGB_LED_GPIO, esp_err_to_name(err));
 		s_led_strip = NULL;
 		return;
 	}
@@ -148,7 +159,7 @@ static void led_init(void)
 	// Create one-shot timer with the configured alert duration
 	s_led_timer = xTimerCreate("led_to_green", pdMS_TO_TICKS(ALERT_DURATION_MS), pdFALSE, NULL, led_timer_cb);
 	if (s_led_timer == NULL) {
-		ESP_LOGW(TAG, "No se pudo crear temporizador de LED");
+		ESP_LOGW(TAG, "Failed to create LED timer");
 	}
 	// Idle state: green
 	led_set_rgb(0, 255, 0);
@@ -166,7 +177,7 @@ static void buzzer_init(void)
 	};
 	esp_err_t err = ledc_timer_config(&tcfg);
 	if (err != ESP_OK) {
-		ESP_LOGW(TAG, "LEDC timer cfg fallo: %s", esp_err_to_name(err));
+		ESP_LOGW(TAG, "LEDC timer config failed: %s", esp_err_to_name(err));
 	}
 	ledc_channel_config_t ccfg = {
 		.gpio_num = BUZZER_GPIO,
@@ -180,7 +191,7 @@ static void buzzer_init(void)
 	};
 	err = ledc_channel_config(&ccfg);
 	if (err != ESP_OK) {
-		ESP_LOGW(TAG, "LEDC channel cfg fallo: %s", esp_err_to_name(err));
+		ESP_LOGW(TAG, "LEDC channel config failed: %s", esp_err_to_name(err));
 	}
 	// Compute duty for the configured volume
 	uint32_t max_duty = (1U << (int)BUZZER_LEDC_DUTY_RES) - 1U;
@@ -234,11 +245,46 @@ static void mark_alerted_for(uint16_t short_addr)
 	}
 }
 
+// Trigger simulation alarm (same as bulb detection)
+static void trigger_simulation_alarm(void)
+{
+	if (s_simulation_alerted) return; // Avoid multiple alerts
+	s_simulation_alerted = true;
+
+	// Set LED red for the configured duration
+	led_set_rgb(255, 0, 0);
+	if (s_led_timer) {
+		xTimerStop(s_led_timer, 0);
+		xTimerStart(s_led_timer, 0);
+	}
+	// Active buzzer: start 2 Hz blinking
+	buzzer_timer_create();
+	// Ensure starting in ON state (duty according to volume) and state coherence
+	(void)ledc_set_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL, s_buzzer_on_duty);
+	(void)ledc_update_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL);
+	s_buzzer_state = true; // next toggle -> OFF
+	if (s_buzzer_timer) {
+		xTimerStop(s_buzzer_timer, 0);
+		xTimerStart(s_buzzer_timer, 0);
+	}
+	ESP_LOGW(TAG, "SIMULATION ALERT: Triggered by HIGH on GPIO %d", SIMULATION_PIN);
+}
+
+// Periodic callback to check simulation pin
+static void simulation_check_cb(TimerHandle_t xTimer)
+{
+	(void)xTimer;
+	int level = gpio_get_level(SIMULATION_PIN);
+	if (level == 1) {
+		trigger_simulation_alarm();
+	}
+}
+
 // Scan complete callback: logs discovered networks
 static void zb_scan_complete_cb(esp_zb_zdp_status_t zdo_status, uint8_t count,
 								esp_zb_network_descriptor_t *nwk_list)
 {
-	ESP_LOGI(TAG, "Escaneo completado: status=%d, redes encontradas=%d", zdo_status, count);
+	ESP_LOGI(TAG, "Scan complete: status=%d, networks found=%d", zdo_status, count);
 	for (uint8_t i = 0; i < count; i++) {
 		esp_zb_network_descriptor_t *d = &nwk_list[i];
 		ESP_LOGI(TAG,
@@ -251,7 +297,7 @@ static void zb_scan_complete_cb(esp_zb_zdp_status_t zdo_status, uint8_t count,
 				 d->permit_joining, d->router_capacity, d->end_device_capacity);
 	}
 	if (count == 0) {
-		ESP_LOGW(TAG, "No se han encontrado redes Zigbee.");
+		ESP_LOGW(TAG, "No Zigbee networks found.");
 	}
 	// Optionally schedule another scan (e.g., every 1s)
 	esp_zb_scheduler_alarm(zb_start_active_scan, 0, 1000);
@@ -270,28 +316,28 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_s)
 	switch (sig) {
 	case ESP_ZB_ZDO_SIGNAL_SKIP_STARTUP:
 		// Stack is ready: form a network as Coordinator and open for joining
-		ESP_LOGI(TAG, "Formando red (BDB network formation)...");
+		ESP_LOGI(TAG, "Forming network (BDB network formation)...");
 		esp_zb_set_bdb_commissioning_mode(ESP_ZB_BDB_MODE_NETWORK_FORMATION);
 		ESP_ERROR_CHECK(esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_FORMATION));
 		break;
 	case ESP_ZB_BDB_SIGNAL_FORMATION:
 		if (st == ESP_OK) {
 			uint8_t ch = esp_zb_get_current_channel();
-			ESP_LOGI(TAG, "Red formada en canal %u. Abriendo red para emparejamiento (steering 180s)...", ch);
+			ESP_LOGI(TAG, "Network formed on channel %u. Opening for joining (steering 180s)...", ch);
 			esp_zb_set_bdb_commissioning_mode(ESP_ZB_BDB_MODE_NETWORK_STEERING);
 			ESP_ERROR_CHECK(esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING));
 		} else {
-			ESP_LOGE(TAG, "Fallo al formar red (status=%s). Reintentando en 3s", esp_err_to_name(st));
+			ESP_LOGE(TAG, "Failed to form network (status=%s). Retrying in 3s", esp_err_to_name(st));
 			esp_zb_scheduler_alarm(NULL, 0, 3000); // placeholder to retry later if desired
 		}
 		break;
 	case ESP_ZB_BDB_SIGNAL_STEERING:
 		if (st == ESP_OK) {
-			ESP_LOGI(TAG, "Steering completado. Mantendremos la red abierta reintentando steering periódicamente.");
+			ESP_LOGI(TAG, "Steering completed. We will keep reopening steering periodically.");
 			// Re-open steering every 60s to make joining easier if the window was missed
 			esp_zb_scheduler_alarm(reopen_steering_cb, 0, 60000);
 		} else {
-			ESP_LOGW(TAG, "Steering fallido o cancelado (%s). Reintentando en 10s", esp_err_to_name(st));
+			ESP_LOGW(TAG, "Steering failed or cancelled (%s). Retrying in 10s", esp_err_to_name(st));
 			esp_zb_scheduler_alarm(reopen_steering_cb, 0, 10000);
 		}
 		break;
@@ -305,10 +351,10 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_s)
 					p->ieee_addr[3], p->ieee_addr[2], p->ieee_addr[1], p->ieee_addr[0],
 					p->capability);
 			esp_zb_zdo_active_ep_req_param_t aep = {.addr_of_interest = p->device_short_addr};
-			ESP_LOGI(TAG, "Solicitando ActiveEP a 0x%04X", p->device_short_addr);
+			ESP_LOGI(TAG, "Requesting ActiveEP to 0x%04X", p->device_short_addr);
             esp_zb_zdo_active_ep_req(&aep, active_ep_cb, (void *)(uintptr_t)p->device_short_addr);
 		} else {
-			ESP_LOGW(TAG, "DEVICE_ANNCE sin parámetros. Ignorando");
+			ESP_LOGW(TAG, "DEVICE_ANNCE without params. Ignoring");
 		}
 		}
 		break;
@@ -320,7 +366,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_s)
 static void zb_start_active_scan(uint8_t param)
 {
 	(void)param;
-	ESP_LOGI(TAG, "Iniciando escaneo activo Zigbee: mask=0x%08lX dur=%u",
+	ESP_LOGI(TAG, "Starting Zigbee active scan: mask=0x%08lX dur=%u",
 			 (unsigned long)ZB_SCAN_CHANNEL_MASK, (unsigned)ZB_SCAN_DURATION);
 	// Launch active scan; callback will run from the Zigbee task
 	esp_zb_zdo_active_scan_request(ZB_SCAN_CHANNEL_MASK, ZB_SCAN_DURATION, zb_scan_complete_cb);
@@ -330,10 +376,10 @@ static void active_ep_cb(esp_zb_zdp_status_t zdo_status, uint8_t ep_count, uint8
 {
 	uint16_t nwk_addr = (uint16_t)(uintptr_t)user_ctx;
 	if (zdo_status != ESP_ZB_ZDP_STATUS_SUCCESS || ep_count == 0 || !ep_id_list) {
-		ESP_LOGW(TAG, "ActiveEP fallo/ vacío: status=%d", zdo_status);
+		ESP_LOGW(TAG, "ActiveEP failed/empty: status=%d", zdo_status);
 		return;
 	}
-	ESP_LOGI(TAG, "Endpoints activos de 0x%04X (%u):", nwk_addr, ep_count);
+	ESP_LOGI(TAG, "Active endpoints of 0x%04X (%u):", nwk_addr, ep_count);
 	for (uint8_t i = 0; i < ep_count; i++) {
 		ESP_LOGI(TAG, "  - ep %u", ep_id_list[i]);
 	}
@@ -351,7 +397,7 @@ static void simple_desc_cb(esp_zb_zdp_status_t zdo_status, esp_zb_af_simple_desc
 {
 	uint16_t nwk_addr = (uint16_t)(uintptr_t)user_ctx;
 	if (zdo_status != ESP_ZB_ZDP_STATUS_SUCCESS || !sd) {
-		ESP_LOGW(TAG, "SimpleDesc fallo: status=%d", zdo_status);
+		ESP_LOGW(TAG, "SimpleDesc failed: status=%d", zdo_status);
 		return;
 	}
 	ESP_LOGI(TAG, "SimpleDesc: ep=%u profile=0x%04X device=0x%04X", sd->endpoint, sd->app_profile_id, sd->app_device_id);
@@ -360,7 +406,7 @@ static void simple_desc_cb(esp_zb_zdp_status_t zdo_status, esp_zb_af_simple_desc
 		// Try reading Basic 0x0000 (Manufacturer Name 0x0004, Model Id 0x0005)
 		try_read_basic_attrs(nwk_addr, sd->endpoint);
 	} else {
-		ESP_LOGI(TAG, "Perfil no-HA (0x%04X) en ep %u: omitimos lectura Basic", sd->app_profile_id, sd->endpoint);
+		ESP_LOGI(TAG, "Non-HA profile (0x%04X) on ep %u: skipping Basic read", sd->app_profile_id, sd->endpoint);
 	}
 }
 
@@ -383,7 +429,7 @@ static void try_read_basic_attrs(uint16_t nwk_addr, uint8_t endpoint)
 		.attr_field = attrs,
 	};
 	uint8_t tsn = esp_zb_zcl_read_attr_cmd_req(&cmd);
-	ESP_LOGI(TAG, "Leyendo Basic attrs (tsn=%u) a 0x%04X/ep%u", tsn, nwk_addr, endpoint);
+	ESP_LOGI(TAG, "Reading Basic attrs (tsn=%u) to 0x%04X/ep%u", tsn, nwk_addr, endpoint);
 }
 
 static esp_err_t zcl_action_handler(esp_zb_core_action_callback_id_t cb_id, const void *message)
@@ -428,13 +474,13 @@ static esp_err_t zcl_action_handler(esp_zb_core_action_callback_id_t cb_id, cons
 				// Ensure starting in ON state (duty according to volume) and state coherence
 				(void)ledc_set_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL, s_buzzer_on_duty);
 				(void)ledc_update_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL);
-				s_buzzer_state = true; // siguiente toggle -> OFF
+				s_buzzer_state = true; // next toggle -> OFF
 				if (s_buzzer_timer) {
 					xTimerStop(s_buzzer_timer, 0);
 					xTimerStart(s_buzzer_timer, 0);
 				}
 				if (!has_alerted_for(src)) {
-					ESP_LOGW(TAG, "ALERTA: Detectada bombilla IKEA TRÅDFRI (0x%04X ep%u)", src, m->info.src_endpoint);
+					ESP_LOGW(TAG, "ALERT: IKEA TRÅDFRI bulb detected (0x%04X ep%u)", src, m->info.src_endpoint);
 					mark_alerted_for(src);
 				}
 			}
@@ -478,11 +524,11 @@ static void zigbee_task(void *pv)
 static void reopen_steering_cb(uint8_t param)
 {
 	(void)param;
-	ESP_LOGI(TAG, "Reabriendo red para emparejamiento (steering)…");
+	ESP_LOGI(TAG, "Re-opening network for joining (steering)...");
 	esp_zb_set_bdb_commissioning_mode(ESP_ZB_BDB_MODE_NETWORK_STEERING);
 	esp_err_t err = esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
 	if (err != ESP_OK) {
-		ESP_LOGW(TAG, "No se pudo reabrir steering: %s. Reintentando en 15s", esp_err_to_name(err));
+		ESP_LOGW(TAG, "Failed to reopen steering: %s. Retrying in 15s", esp_err_to_name(err));
 		esp_zb_scheduler_alarm(reopen_steering_cb, 0, 15000);
 	}
 }
@@ -508,6 +554,37 @@ void app_main(void)
 	led_init();
 	// Initialize active buzzer (PWM on GPIO)
 	buzzer_init();
+
+	// Startup beep: 200ms to verify buzzer works
+	(void)ledc_set_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL, s_buzzer_on_duty);
+	(void)ledc_update_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL);
+	vTaskDelay(pdMS_TO_TICKS(200));  // 200ms beep
+	(void)ledc_set_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL, 0);
+	(void)ledc_update_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL);
+
+	// Configure simulation pin as input
+	gpio_config_t sim_io = {
+		.pin_bit_mask = 1ULL << SIMULATION_PIN,
+		.mode = GPIO_MODE_INPUT,
+		.pull_up_en = GPIO_PULLUP_DISABLE,
+		.pull_down_en = GPIO_PULLDOWN_DISABLE,
+		.intr_type = GPIO_INTR_DISABLE,
+	};
+	esp_err_t err = gpio_config(&sim_io);
+	if (err != ESP_OK) {
+		ESP_LOGW(TAG, "Failed to configure GPIO %d for simulation: %s", SIMULATION_PIN, esp_err_to_name(err));
+	}
+
+	// Reset simulation flag
+	s_simulation_alerted = false;
+
+	// Create periodic timer to check simulation pin (every 1 second)
+	TimerHandle_t sim_timer = xTimerCreate("sim_check", pdMS_TO_TICKS(1000), pdTRUE, NULL, simulation_check_cb);
+	if (sim_timer) {
+		xTimerStart(sim_timer, 0);
+	} else {
+		ESP_LOGW(TAG, "Failed to create simulation timer");
+	}
 
 	// Create Zigbee task (larger stack)
 	xTaskCreate(zigbee_task, "zigbee_main", 7168, NULL, 5, NULL);
